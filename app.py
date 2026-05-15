@@ -1,12 +1,9 @@
 import os
-import io
-import re
 import time
 from urllib.parse import urlparse
 
-import pandas as pd
 import requests
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -116,72 +113,32 @@ def priority_score(row):
     return score, priority, ", ".join(dict.fromkeys(reasons))
 
 
-def read_domains_from_excel(file_storage):
-    df = pd.read_excel(file_storage, header=None)
-    websites = []
-
-    for value in df.iloc[:, 0].dropna().tolist():
-        raw = str(value).strip()
-        domain = clean_domain(raw)
-        if domain:
-            websites.append((raw, domain))
-
+def unique_domains_from_websites(websites):
+    result = []
     seen = set()
-    unique_sites = []
-    for raw, domain in websites:
-        if domain not in seen:
-            unique_sites.append((raw, domain))
+    for item in websites:
+        raw = str(item).strip()
+        domain = clean_domain(raw)
+        if domain and domain not in seen:
+            result.append({"original_website": raw, "domain": domain})
             seen.add(domain)
-
-    return unique_sites
+    return result
 
 
 def hunter_domain_search(domain):
     endpoint = "https://api.hunter.io/v2/domain-search"
-    params = {
-        "domain": domain,
-        "api_key": HUNTER_API_KEY,
-        "limit": 100
-    }
-    response = requests.get(endpoint, params=params, timeout=45)
-    return response
+    params = {"domain": domain, "api_key": HUNTER_API_KEY, "limit": 100}
+    return requests.get(endpoint, params=params, timeout=45)
 
 
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({
-        "service": "Hunter Email Server",
-        "status": "running",
-        "endpoints": ["/health", "/extract-priority-emails", "/openapi.json"]
-    })
-
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({
-        "status": "ok",
-        "hunter_api_key_loaded": bool(HUNTER_API_KEY)
-    })
-
-
-@app.route("/extract-priority-emails", methods=["POST"])
-def extract_priority_emails():
-    if not HUNTER_API_KEY:
-        return jsonify({"error": "HUNTER_API_KEY environment variable is missing."}), 500
-
-    if "file" not in request.files:
-        return jsonify({"error": "Please upload an Excel file using form field name 'file'."}), 400
-
-    uploaded_file = request.files["file"]
-
-    try:
-        unique_sites = read_domains_from_excel(uploaded_file)
-    except Exception as exc:
-        return jsonify({"error": f"Failed to read Excel file: {str(exc)}"}), 400
-
+def collect_contacts(websites):
+    unique_sites = unique_domains_from_websites(websites)
     results = []
 
-    for idx, (website, domain) in enumerate(unique_sites, start=1):
+    for idx, site in enumerate(unique_sites, start=1):
+        website = site["original_website"]
+        domain = site["domain"]
+
         try:
             response = hunter_domain_search(domain)
 
@@ -193,12 +150,7 @@ def extract_priority_emails():
 
                 if emails:
                     for e in emails:
-                        sources = e.get("sources", [])
-                        source_urls = ", ".join([
-                            s.get("uri", "") for s in sources[:5] if isinstance(s, dict)
-                        ])
-
-                        results.append({
+                        row = {
                             "No": idx,
                             "Original Website": website,
                             "Domain": domain,
@@ -214,135 +166,122 @@ def extract_priority_emails():
                             "Seniority": e.get("seniority", ""),
                             "LinkedIn": e.get("linkedin", ""),
                             "Twitter": e.get("twitter", ""),
-                            "Phone Number": e.get("phone_number", ""),
-                            "Source URLs": source_urls,
-                            "Message": ""
-                        })
+                            "Phone Number": e.get("phone_number", "")
+                        }
+                        score, priority, reason = priority_score(row)
+                        row["Priority Score"] = score
+                        row["Priority"] = priority
+                        row["Priority Reason"] = reason
+                        results.append(row)
                 else:
                     results.append({
-                        "No": idx,
-                        "Original Website": website,
-                        "Domain": domain,
-                        "Status": "NO EMAIL FOUND",
-                        "Company": company,
-                        "Email": "",
-                        "Type": "",
-                        "Confidence": "",
-                        "First Name": "",
-                        "Last Name": "",
-                        "Position": "",
-                        "Department": "",
-                        "Seniority": "",
-                        "LinkedIn": "",
-                        "Twitter": "",
-                        "Phone Number": "",
-                        "Source URLs": "",
-                        "Message": "No email found by Hunter"
+                        "No": idx, "Original Website": website, "Domain": domain,
+                        "Status": "NO EMAIL FOUND", "Company": company, "Email": "",
+                        "Type": "", "Confidence": "", "First Name": "", "Last Name": "",
+                        "Position": "", "Department": "", "Seniority": "", "LinkedIn": "",
+                        "Twitter": "", "Phone Number": "", "Priority Score": 0,
+                        "Priority": "Exclude", "Priority Reason": "No email found"
                     })
 
             else:
                 results.append({
-                    "No": idx,
-                    "Original Website": website,
-                    "Domain": domain,
-                    "Status": "API ERROR",
-                    "Company": "",
-                    "Email": "",
-                    "Type": "",
-                    "Confidence": "",
-                    "First Name": "",
-                    "Last Name": "",
-                    "Position": "",
-                    "Department": "",
-                    "Seniority": "",
-                    "LinkedIn": "",
-                    "Twitter": "",
-                    "Phone Number": "",
-                    "Source URLs": "",
-                    "Message": f"HTTP {response.status_code}: {response.text[:300]}"
+                    "No": idx, "Original Website": website, "Domain": domain,
+                    "Status": "API ERROR", "Company": "", "Email": "", "Type": "",
+                    "Confidence": "", "First Name": "", "Last Name": "", "Position": "",
+                    "Department": "", "Seniority": "", "LinkedIn": "", "Twitter": "",
+                    "Phone Number": "", "Priority Score": 0, "Priority": "Exclude",
+                    "Priority Reason": f"HTTP {response.status_code}"
                 })
 
         except Exception as exc:
             results.append({
-                "No": idx,
-                "Original Website": website,
-                "Domain": domain,
-                "Status": "ERROR",
-                "Company": "",
-                "Email": "",
-                "Type": "",
-                "Confidence": "",
-                "First Name": "",
-                "Last Name": "",
-                "Position": "",
-                "Department": "",
-                "Seniority": "",
-                "LinkedIn": "",
-                "Twitter": "",
-                "Phone Number": "",
-                "Source URLs": "",
-                "Message": str(exc)
+                "No": idx, "Original Website": website, "Domain": domain,
+                "Status": "ERROR", "Company": "", "Email": "", "Type": "",
+                "Confidence": "", "First Name": "", "Last Name": "", "Position": "",
+                "Department": "", "Seniority": "", "LinkedIn": "", "Twitter": "",
+                "Phone Number": "", "Priority Score": 0, "Priority": "Exclude",
+                "Priority Reason": str(exc)
             })
 
         time.sleep(0.25)
 
-    result_df = pd.DataFrame(results)
+    priority_contacts = [
+        row for row in results
+        if row.get("Status") == "FOUND"
+        and "@" in str(row.get("Email", ""))
+        and row.get("Priority") in ["A - Send First", "B - Send If Needed"]
+    ]
 
-    if not result_df.empty:
-        priority_data = result_df.apply(priority_score, axis=1, result_type="expand")
-        result_df["Priority Score"] = priority_data[0]
-        result_df["Priority"] = priority_data[1]
-        result_df["Priority Reason"] = priority_data[2]
-
-    priority_df = result_df[
-        (result_df["Status"] == "FOUND") &
-        (result_df["Email"].astype(str).str.contains("@", na=False)) &
-        (result_df["Priority"].isin(["A - Send First", "B - Send If Needed"]))
-    ].copy()
-
-    if not priority_df.empty:
-        priority_order = {"A - Send First": 1, "B - Send If Needed": 2}
-        priority_df["Priority Order"] = priority_df["Priority"].map(priority_order)
-        priority_df = priority_df.sort_values(
-            by=["Priority Order", "Domain", "Priority Score", "Confidence"],
-            ascending=[True, True, False, False]
-        ).drop(columns=["Priority Order"])
-
-    summary = result_df.groupby("Status", dropna=False).size().reset_index(name="Count") if not result_df.empty else pd.DataFrame(columns=["Status", "Count"])
-    priority_summary = priority_df.groupby("Priority", dropna=False).size().reset_index(name="Count") if not priority_df.empty else pd.DataFrame(columns=["Priority", "Count"])
-    input_df = pd.DataFrame(unique_sites, columns=["Original Website", "Domain"])
-
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        priority_df.to_excel(writer, index=False, sheet_name="Priority Contacts")
-        result_df.to_excel(writer, index=False, sheet_name="All Hunter Results")
-        priority_summary.to_excel(writer, index=False, sheet_name="Priority Summary")
-        summary.to_excel(writer, index=False, sheet_name="Summary")
-        input_df.to_excel(writer, index=False, sheet_name="Input Domains")
-
-    output.seek(0)
-
-    return send_file(
-        output,
-        as_attachment=True,
-        download_name="hunter_priority_sales_contacts.xlsx",
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    priority_contacts = sorted(
+        priority_contacts,
+        key=lambda x: (
+            0 if x.get("Priority") == "A - Send First" else 1,
+            str(x.get("Domain", "")),
+            -int(x.get("Priority Score") or 0),
+            -int(x.get("Confidence") or 0)
+        )
     )
+
+    return unique_sites, results, priority_contacts
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "service": "Hunter Email Server",
+        "status": "running",
+        "mode": "json_action",
+        "endpoints": ["/health", "/extract-priority-emails-json", "/openapi.json"]
+    })
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "hunter_api_key_loaded": bool(HUNTER_API_KEY)})
+
+
+@app.route("/extract-priority-emails-json", methods=["POST"])
+def extract_priority_emails_json():
+    if not HUNTER_API_KEY:
+        return jsonify({"error": "HUNTER_API_KEY environment variable is missing."}), 500
+
+    body = request.get_json(silent=True) or {}
+    websites = body.get("websites", [])
+
+    if not isinstance(websites, list) or len(websites) == 0:
+        return jsonify({
+            "error": "Please provide websites as a JSON array.",
+            "example": {"websites": ["https://example.com", "example2.com"]}
+        }), 400
+
+    unique_sites, all_results, priority_contacts = collect_contacts(websites)
+
+    status_counts = {}
+    for row in all_results:
+        status = row.get("Status", "UNKNOWN")
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    return jsonify({
+        "input_website_count": len(unique_sites),
+        "all_result_count": len(all_results),
+        "priority_contact_count": len(priority_contacts),
+        "status_counts": status_counts,
+        "priority_contacts": priority_contacts,
+        "all_results": all_results
+    })
 
 
 @app.route("/openapi.json", methods=["GET"])
 def openapi():
     server_url = request.url_root.rstrip("/")
-    schema = {
+    return jsonify({
         "openapi": "3.1.0",
         "info": {
             "title": "Hunter Priority Email Extraction API",
-            "version": "1.0.0",
-            "description": "Upload an Excel file containing website URLs and receive an Excel file with priority sales contacts extracted via Hunter."
+            "version": "2.0.0",
+            "description": "Send website URLs as JSON and receive priority sales contacts extracted via Hunter."
         },
-        "servers": [
-            {"url": server_url}
-        ],
+        "servers": [{"url": server_url}],
         "paths": {
             "/health": {
                 "get": {
@@ -354,7 +293,11 @@ def openapi():
                             "content": {
                                 "application/json": {
                                     "schema": {
-                                        "type": "object"
+                                        "type": "object",
+                                        "properties": {
+                                            "status": {"type": "string"},
+                                            "hunter_api_key_loaded": {"type": "boolean"}
+                                        }
                                     }
                                 }
                             }
@@ -362,52 +305,54 @@ def openapi():
                     }
                 }
             },
-            "/extract-priority-emails": {
+            "/extract-priority-emails-json": {
                 "post": {
-                    "operationId": "extractPriorityEmails",
-                    "summary": "Extract priority sales emails from uploaded Excel website list",
+                    "operationId": "extractPriorityEmailsJson",
+                    "summary": "Extract priority sales emails from website URL list",
                     "requestBody": {
                         "required": True,
                         "content": {
-                            "multipart/form-data": {
+                            "application/json": {
                                 "schema": {
                                     "type": "object",
                                     "properties": {
-                                        "file": {
-                                            "type": "string",
-                                            "format": "binary",
-                                            "description": "Excel file containing website URLs or domains in the first column."
+                                        "websites": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                            "description": "Website URLs or domains extracted from the uploaded Excel file."
                                         }
                                     },
-                                    "required": ["file"]
+                                    "required": ["websites"]
                                 }
                             }
                         }
                     },
                     "responses": {
                         "200": {
-                            "description": "Excel file containing priority sales contacts",
+                            "description": "Priority sales contacts in JSON format",
                             "content": {
-                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {
+                                "application/json": {
                                     "schema": {
-                                        "type": "string",
-                                        "format": "binary"
+                                        "type": "object",
+                                        "properties": {
+                                            "input_website_count": {"type": "integer"},
+                                            "all_result_count": {"type": "integer"},
+                                            "priority_contact_count": {"type": "integer"},
+                                            "status_counts": {"type": "object", "properties": {}},
+                                            "priority_contacts": {"type": "array", "items": {"type": "object", "properties": {}}},
+                                            "all_results": {"type": "array", "items": {"type": "object", "properties": {}}}
+                                        }
                                     }
                                 }
                             }
                         },
-                        "400": {
-                            "description": "Invalid request"
-                        },
-                        "500": {
-                            "description": "Server error"
-                        }
+                        "400": {"description": "Invalid request"},
+                        "500": {"description": "Server error"}
                     }
                 }
             }
         }
-    }
-    return jsonify(schema)
+    })
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ services:
   - type: web
     name: hunter-email-server
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install --only-binary=:all: -r requirements.txt
     startCommand: gunicorn app:app
     envVars:
       - key: HUNTER_API_KEY
