@@ -1,46 +1,16 @@
 import os
+import io
 import time
 from urllib.parse import urlparse
 
+import pandas as pd
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
-
 HUNTER_API_KEY = os.environ.get("HUNTER_API_KEY", "")
-
-HIGH_KEYWORDS = [
-    "sales", "account", "business development", "bdm", "commercial",
-    "parts", "spare", "procurement", "purchasing", "purchase",
-    "sourcing", "supply", "supplier", "buyer", "import", "export",
-    "product manager", "category manager"
-]
-
-DECISION_KEYWORDS = [
-    "manager", "director", "head", "chief", "general manager",
-    "owner", "founder", "ceo", "president", "operations"
-]
-
-EXCLUDE_KEYWORDS = [
-    "hr", "human resources", "recruit", "career", "finance",
-    "accounts payable", "accounts receivable", "invoice", "billing",
-    "marketing", "brand", "graphic", "designer", "webmaster",
-    "software", "developer", "technician", "service technician",
-    "mechanic", "admin", "reception"
-]
-
-GENERIC_PRIORITY_EMAILS = [
-    "sales@", "parts@", "purchasing@", "procurement@", "buying@",
-    "imports@", "import@", "exports@", "export@", "enquiries@",
-    "inquiries@", "info@"
-]
-
-GENERIC_EXCLUDE_EMAILS = [
-    "careers@", "jobs@", "hr@", "accounts@", "invoice@", "billing@",
-    "marketing@", "webmaster@", "support@"
-]
 
 
 def clean_domain(value):
@@ -51,8 +21,7 @@ def clean_domain(value):
         value = "https://" + value
     parsed = urlparse(value)
     domain = parsed.netloc or parsed.path
-    domain = domain.replace("www.", "").split("/")[0].strip()
-    return domain
+    return domain.replace("www.", "").split("/")[0].strip()
 
 
 def priority_score(row):
@@ -60,179 +29,155 @@ def priority_score(row):
     position = str(row.get("Position", "")).lower()
     department = str(row.get("Department", "")).lower()
     seniority = str(row.get("Seniority", "")).lower()
-    type_ = str(row.get("Type", "")).lower()
-    text = " ".join([email, position, department, seniority, type_])
+    typ = str(row.get("Type", "")).lower()
+    text = " ".join([email, position, department, seniority, typ])
 
-    score = 0
-    reasons = []
+    high_keywords = ["sales", "account", "business development", "bdm", "commercial", "parts", "spare", "procurement", "purchasing", "purchase", "sourcing", "supply", "supplier", "buyer", "import", "export", "product manager", "category manager"]
+    decision_keywords = ["manager", "director", "head", "chief", "general manager", "owner", "founder", "ceo", "president", "operations"]
+    exclude_keywords = ["hr", "human resources", "recruit", "career", "finance", "accounts payable", "accounts receivable", "invoice", "billing", "marketing", "brand", "graphic", "designer", "webmaster", "software", "developer", "technician", "service technician", "mechanic", "admin", "reception"]
+    generic_priority_emails = ["sales@", "parts@", "purchasing@", "procurement@", "buying@", "imports@", "import@", "exports@", "export@", "enquiries@", "inquiries@", "info@"]
+    generic_exclude_emails = ["careers@", "jobs@", "hr@", "accounts@", "invoice@", "billing@", "marketing@", "webmaster@", "support@"]
 
-    for keyword in HIGH_KEYWORDS:
-        if keyword in text:
-            score += 30
-            reasons.append(keyword)
-
-    for keyword in DECISION_KEYWORDS:
-        if keyword in text:
-            score += 15
-            reasons.append(keyword)
-
-    for keyword in GENERIC_PRIORITY_EMAILS:
-        if keyword in email:
-            score += 25
-            reasons.append(keyword)
-
-    for keyword in GENERIC_EXCLUDE_EMAILS:
-        if keyword in email:
-            score -= 40
-            reasons.append("exclude:" + keyword)
-
-    for keyword in EXCLUDE_KEYWORDS:
-        if keyword in text:
-            score -= 30
-            reasons.append("exclude:" + keyword)
-
-    if type_ == "personal":
+    score, reasons = 0, []
+    for k in high_keywords:
+        if k in text:
+            score += 30; reasons.append(k)
+    for k in decision_keywords:
+        if k in text:
+            score += 15; reasons.append(k)
+    for k in generic_priority_emails:
+        if k in email:
+            score += 25; reasons.append(k)
+    for k in generic_exclude_emails:
+        if k in email:
+            score -= 40; reasons.append("exclude:" + k)
+    for k in exclude_keywords:
+        if k in text:
+            score -= 30; reasons.append("exclude:" + k)
+    if typ == "personal":
         score += 5
-
     try:
         confidence = int(float(row.get("Confidence", 0) or 0))
-        if confidence >= 90:
-            score += 10
-        elif confidence >= 70:
-            score += 5
+        if confidence >= 90: score += 10
+        elif confidence >= 70: score += 5
     except Exception:
         pass
 
-    if score >= 55:
-        priority = "A - Send First"
-    elif score >= 30:
-        priority = "B - Send If Needed"
-    else:
-        priority = "Exclude"
-
+    if score >= 55: priority = "A - Send First"
+    elif score >= 30: priority = "B - Send If Needed"
+    else: priority = "C - Low / Exclude"
     return score, priority, ", ".join(dict.fromkeys(reasons))
 
 
-def unique_domains_from_websites(websites):
-    result = []
-    seen = set()
+def normalize_websites(websites):
+    rows, seen = [], set()
     for item in websites:
         raw = str(item).strip()
         domain = clean_domain(raw)
         if domain and domain not in seen:
-            result.append({"original_website": raw, "domain": domain})
+            rows.append({"Original Website": raw, "Domain": domain})
             seen.add(domain)
-    return result
+    return rows
 
 
-def hunter_domain_search(domain):
-    endpoint = "https://api.hunter.io/v2/domain-search"
-    params = {"domain": domain, "api_key": HUNTER_API_KEY, "limit": 100}
-    return requests.get(endpoint, params=params, timeout=45)
-
-
-def collect_contacts(websites):
-    unique_sites = unique_domains_from_websites(websites)
-    results = []
-
-    for idx, site in enumerate(unique_sites, start=1):
-        website = site["original_website"]
-        domain = site["domain"]
-
-        try:
-            response = hunter_domain_search(domain)
-
-            if response.status_code == 200:
-                data = response.json()
-                info = data.get("data", {})
-                company = info.get("organization", "")
-                emails = info.get("emails", [])
-
-                if emails:
-                    for e in emails:
-                        row = {
-                            "No": idx,
-                            "Original Website": website,
-                            "Domain": domain,
-                            "Status": "FOUND",
-                            "Company": company,
-                            "Email": e.get("value", ""),
-                            "Type": e.get("type", ""),
-                            "Confidence": e.get("confidence", ""),
-                            "First Name": e.get("first_name", ""),
-                            "Last Name": e.get("last_name", ""),
-                            "Position": e.get("position", ""),
-                            "Department": e.get("department", ""),
-                            "Seniority": e.get("seniority", ""),
-                            "LinkedIn": e.get("linkedin", ""),
-                            "Twitter": e.get("twitter", ""),
-                            "Phone Number": e.get("phone_number", "")
-                        }
-                        score, priority, reason = priority_score(row)
-                        row["Priority Score"] = score
-                        row["Priority"] = priority
-                        row["Priority Reason"] = reason
-                        results.append(row)
-                else:
-                    results.append({
-                        "No": idx, "Original Website": website, "Domain": domain,
-                        "Status": "NO EMAIL FOUND", "Company": company, "Email": "",
-                        "Type": "", "Confidence": "", "First Name": "", "Last Name": "",
-                        "Position": "", "Department": "", "Seniority": "", "LinkedIn": "",
-                        "Twitter": "", "Phone Number": "", "Priority Score": 0,
-                        "Priority": "Exclude", "Priority Reason": "No email found"
-                    })
-
-            else:
-                results.append({
-                    "No": idx, "Original Website": website, "Domain": domain,
-                    "Status": "API ERROR", "Company": "", "Email": "", "Type": "",
-                    "Confidence": "", "First Name": "", "Last Name": "", "Position": "",
-                    "Department": "", "Seniority": "", "LinkedIn": "", "Twitter": "",
-                    "Phone Number": "", "Priority Score": 0, "Priority": "Exclude",
-                    "Priority Reason": f"HTTP {response.status_code}"
-                })
-
-        except Exception as exc:
-            results.append({
-                "No": idx, "Original Website": website, "Domain": domain,
-                "Status": "ERROR", "Company": "", "Email": "", "Type": "",
-                "Confidence": "", "First Name": "", "Last Name": "", "Position": "",
-                "Department": "", "Seniority": "", "LinkedIn": "", "Twitter": "",
-                "Phone Number": "", "Priority Score": 0, "Priority": "Exclude",
-                "Priority Reason": str(exc)
-            })
-
-        time.sleep(0.25)
-
-    priority_contacts = [
-        row for row in results
-        if row.get("Status") == "FOUND"
-        and "@" in str(row.get("Email", ""))
-        and row.get("Priority") in ["A - Send First", "B - Send If Needed"]
-    ]
-
-    priority_contacts = sorted(
-        priority_contacts,
-        key=lambda x: (
-            0 if x.get("Priority") == "A - Send First" else 1,
-            str(x.get("Domain", "")),
-            -int(x.get("Priority Score") or 0),
-            -int(x.get("Confidence") or 0)
+def hunter_domain_search_all(domain):
+    all_emails, company, errors = [], "", []
+    limit, offset, max_pages = 100, 0, 20
+    for _ in range(max_pages):
+        response = requests.get(
+            "https://api.hunter.io/v2/domain-search",
+            params={"domain": domain, "api_key": HUNTER_API_KEY, "limit": limit, "offset": offset},
+            timeout=60,
         )
-    )
+        if response.status_code != 200:
+            errors.append(f"HTTP {response.status_code}: {response.text[:300]}")
+            break
+        data = response.json()
+        info = data.get("data", {})
+        company = info.get("organization", company)
+        emails = info.get("emails", []) or []
+        all_emails.extend(emails)
+        if len(emails) < limit:
+            break
+        offset += limit
+        time.sleep(0.2)
+    return company, all_emails, errors
 
-    return unique_sites, results, priority_contacts
+
+def build_results(websites):
+    input_sites = normalize_websites(websites)
+    all_rows = []
+    for idx, item in enumerate(input_sites, start=1):
+        website, domain = item["Original Website"], item["Domain"]
+        try:
+            company, emails, errors = hunter_domain_search_all(domain)
+            if errors:
+                all_rows.append({"No": idx, "Original Website": website, "Domain": domain, "Status": "API ERROR", "Company": company, "Email": "", "Message": " / ".join(errors)})
+                continue
+            if not emails:
+                all_rows.append({"No": idx, "Original Website": website, "Domain": domain, "Status": "NO EMAIL FOUND", "Company": company, "Email": "", "Message": "No email found by Hunter"})
+                continue
+            for e in emails:
+                sources = e.get("sources", []) or []
+                source_urls = ", ".join([str(s.get("uri", "")) for s in sources if isinstance(s, dict) and s.get("uri")])
+                row = {
+                    "No": idx,
+                    "Original Website": website,
+                    "Domain": domain,
+                    "Status": "FOUND",
+                    "Company": company,
+                    "Email": e.get("value", ""),
+                    "Type": e.get("type", ""),
+                    "Confidence": e.get("confidence", ""),
+                    "First Name": e.get("first_name", ""),
+                    "Last Name": e.get("last_name", ""),
+                    "Position": e.get("position", ""),
+                    "Department": e.get("department", ""),
+                    "Seniority": e.get("seniority", ""),
+                    "LinkedIn": e.get("linkedin", ""),
+                    "Twitter": e.get("twitter", ""),
+                    "Phone Number": e.get("phone_number", ""),
+                    "Source Count": len(sources),
+                    "Source URLs": source_urls,
+                    "Message": "",
+                }
+                score, priority, reason = priority_score(row)
+                row["Priority Score"] = score
+                row["Priority"] = priority
+                row["Priority Reason"] = reason
+                all_rows.append(row)
+        except Exception as exc:
+            all_rows.append({"No": idx, "Original Website": website, "Domain": domain, "Status": "ERROR", "Company": "", "Email": "", "Message": str(exc)})
+        time.sleep(0.25)
+    return input_sites, all_rows
+
+
+def make_excel(input_sites, all_rows):
+    result_df = pd.DataFrame(all_rows)
+    input_df = pd.DataFrame(input_sites)
+    if result_df.empty:
+        found_df = pd.DataFrame()
+        priority_df = pd.DataFrame()
+    else:
+        found_df = result_df[(result_df["Status"] == "FOUND") & (result_df["Email"].astype(str).str.contains("@", na=False))].copy()
+        priority_df = found_df[found_df.get("Priority", "").isin(["A - Send First", "B - Send If Needed"])].copy() if not found_df.empty else pd.DataFrame()
+    summary = result_df.groupby("Status", dropna=False).size().reset_index(name="Count") if not result_df.empty else pd.DataFrame(columns=["Status", "Count"])
+    by_domain = found_df.groupby("Domain", dropna=False).size().reset_index(name="Email Count") if not found_df.empty else pd.DataFrame(columns=["Domain", "Email Count"])
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        found_df.to_excel(writer, index=False, sheet_name="All Found Emails")
+        priority_df.to_excel(writer, index=False, sheet_name="Priority Contacts")
+        result_df.to_excel(writer, index=False, sheet_name="Raw Results")
+        by_domain.to_excel(writer, index=False, sheet_name="Email Count by Domain")
+        summary.to_excel(writer, index=False, sheet_name="Status Summary")
+        input_df.to_excel(writer, index=False, sheet_name="Input Domains")
+    output.seek(0)
+    return output
 
 
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({
-        "service": "Hunter Email Server",
-        "status": "running",
-        "mode": "json_action",
-        "endpoints": ["/health", "/extract-priority-emails-json", "/openapi.json"]
-    })
+    return jsonify({"service": "Hunter Full Email XLSX Server", "status": "running"})
 
 
 @app.route("/health", methods=["GET"])
@@ -240,35 +185,17 @@ def health():
     return jsonify({"status": "ok", "hunter_api_key_loaded": bool(HUNTER_API_KEY)})
 
 
-@app.route("/extract-priority-emails-json", methods=["POST"])
-def extract_priority_emails_json():
+@app.route("/extract-all-emails-xlsx", methods=["POST"])
+def extract_all_emails_xlsx():
     if not HUNTER_API_KEY:
         return jsonify({"error": "HUNTER_API_KEY environment variable is missing."}), 500
-
     body = request.get_json(silent=True) or {}
     websites = body.get("websites", [])
-
-    if not isinstance(websites, list) or len(websites) == 0:
-        return jsonify({
-            "error": "Please provide websites as a JSON array.",
-            "example": {"websites": ["https://example.com", "example2.com"]}
-        }), 400
-
-    unique_sites, all_results, priority_contacts = collect_contacts(websites)
-
-    status_counts = {}
-    for row in all_results:
-        status = row.get("Status", "UNKNOWN")
-        status_counts[status] = status_counts.get(status, 0) + 1
-
-    return jsonify({
-        "input_website_count": len(unique_sites),
-        "all_result_count": len(all_results),
-        "priority_contact_count": len(priority_contacts),
-        "status_counts": status_counts,
-        "priority_contacts": priority_contacts,
-        "all_results": all_results
-    })
+    if not isinstance(websites, list) or not websites:
+        return jsonify({"error": "Please provide websites as a JSON array."}), 400
+    input_sites, all_rows = build_results(websites)
+    excel_file = make_excel(input_sites, all_rows)
+    return send_file(excel_file, as_attachment=True, download_name="hunter_all_emails.xlsx", mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 @app.route("/openapi.json", methods=["GET"])
@@ -276,81 +203,11 @@ def openapi():
     server_url = request.url_root.rstrip("/")
     return jsonify({
         "openapi": "3.1.0",
-        "info": {
-            "title": "Hunter Priority Email Extraction API",
-            "version": "2.0.0",
-            "description": "Send website URLs as JSON and receive priority sales contacts extracted via Hunter."
-        },
+        "info": {"title": "Hunter Full Email Extraction API", "version": "3.0.0", "description": "Send website URLs as JSON. Server queries Hunter with pagination and returns all discovered emails as XLSX."},
         "servers": [{"url": server_url}],
         "paths": {
-            "/health": {
-                "get": {
-                    "operationId": "healthCheck",
-                    "summary": "Check server status",
-                    "responses": {
-                        "200": {
-                            "description": "Server health status",
-                            "content": {
-                                "application/json": {
-                                    "schema": {
-                                        "type": "object",
-                                        "properties": {
-                                            "status": {"type": "string"},
-                                            "hunter_api_key_loaded": {"type": "boolean"}
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "/extract-priority-emails-json": {
-                "post": {
-                    "operationId": "extractPriorityEmailsJson",
-                    "summary": "Extract priority sales emails from website URL list",
-                    "requestBody": {
-                        "required": True,
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "websites": {
-                                            "type": "array",
-                                            "items": {"type": "string"},
-                                            "description": "Website URLs or domains extracted from the uploaded Excel file."
-                                        }
-                                    },
-                                    "required": ["websites"]
-                                }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "Priority sales contacts in JSON format",
-                            "content": {
-                                "application/json": {
-                                    "schema": {
-                                        "type": "object",
-                                        "properties": {
-                                            "input_website_count": {"type": "integer"},
-                                            "all_result_count": {"type": "integer"},
-                                            "priority_contact_count": {"type": "integer"},
-                                            "status_counts": {"type": "object", "properties": {}},
-                                            "priority_contacts": {"type": "array", "items": {"type": "object", "properties": {}}},
-                                            "all_results": {"type": "array", "items": {"type": "object", "properties": {}}}
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                        "400": {"description": "Invalid request"},
-                        "500": {"description": "Server error"}
-                    }
-                }
-            }
+            "/health": {"get": {"operationId": "healthCheck", "summary": "Check server status", "responses": {"200": {"description": "Server health status", "content": {"application/json": {"schema": {"type": "object", "properties": {"status": {"type": "string"}, "hunter_api_key_loaded": {"type": "boolean"}}}}}}}}},
+            "/extract-all-emails-xlsx": {"post": {"operationId": "extractAllEmailsXlsx", "summary": "Extract all discovered emails and return XLSX", "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"websites": {"type": "array", "items": {"type": "string"}}}, "required": ["websites"]}}}}, "responses": {"200": {"description": "XLSX file containing all discovered emails", "content": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {"schema": {"type": "string", "format": "binary"}}}}, "400": {"description": "Invalid request"}, "500": {"description": "Server error"}}}}
         }
     })
 
